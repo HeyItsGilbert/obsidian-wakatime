@@ -1,4 +1,4 @@
-import { apiVersion, App, MarkdownView, Modal, Plugin, Setting, TextComponent } from 'obsidian';
+import { apiVersion, App, MarkdownView, Modal, Plugin, PluginSettingTab, Setting, TextComponent } from 'obsidian';
 import * as child_process from 'child_process';
 
 import { Options, OptionSetting } from './options';
@@ -33,6 +33,14 @@ export default class WakaTime extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: 'wakatime-project',
+      name: 'WakaTime Project',
+      callback: () => {
+        this.promptForProject();
+      },
+    });
+
     this.options.getSetting('settings', 'debug', false, (debug: OptionSetting) => {
       this.logger.setLevel(debug.value == 'true' ? LogLevel.DEBUG : LogLevel.INFO);
       this.dependencies = new Dependencies(this.options, this.logger);
@@ -46,9 +54,11 @@ export default class WakaTime extends Plugin {
         this.initializeDependencies();
       });
     });
+
+    this.addSettingTab(new WakaTimeSettingTab(this.app, this));
   }
 
-  onunload() {}
+  onunload() { }
 
   public initializeDependencies(): void {
     this.logger.debug(`Initializing WakaTime v${this.manifest.version}`);
@@ -139,16 +149,21 @@ export default class WakaTime extends Plugin {
     new ApiKeyModal(this.app, this.options).open();
   }
 
+  public promptForProject(): void {
+    new ProjectModal(this.app, this.options).open();
+  }
+
   private sendHeartbeat(
     file: string,
     time: number,
     lineno: number,
     cursorpos: number,
     isWrite: boolean,
+    project: string,
   ): void {
     this.options.getApiKey((apiKey) => {
       if (!apiKey) return;
-      this._sendHeartbeat(file, time, lineno, cursorpos, isWrite);
+      this._sendHeartbeat(file, time, lineno, cursorpos, isWrite, project);
     });
   }
 
@@ -158,6 +173,7 @@ export default class WakaTime extends Plugin {
     lineno: number,
     cursorpos: number,
     isWrite: boolean,
+    project: string,
   ): void {
     if (!this.dependencies.isCliInstalled()) return;
 
@@ -170,6 +186,7 @@ export default class WakaTime extends Plugin {
 
     args.push('--lineno', String(lineno + 1));
     args.push('--cursorpos', String(cursorpos + 1));
+    args.push('--project', Utils.quote(project));
 
     if (isWrite) args.push('--write');
 
@@ -358,5 +375,151 @@ class ApiKeyModal extends Modal {
   onClose() {
     const { contentEl } = this;
     contentEl.empty();
+  }
+}
+
+class ProjectModal extends Modal {
+  options: Options;
+  input: TextComponent;
+  private static instance: ProjectModal;
+
+  constructor(app: App, options: Options) {
+    if (ProjectModal.instance) {
+      return ProjectModal.instance;
+    }
+    super(app);
+    this.options = options;
+    ProjectModal.instance = this;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+
+    this.options.getSetting('settings', 'project_name', false, (setting: OptionSetting) => {
+      let defaultVal = setting.value;
+      if (Utils.apiKeyInvalid(defaultVal)) defaultVal = '';
+
+      contentEl.createEl('h2', { text: 'Enter your WakaTime Project Name' });
+
+      new Setting(contentEl).addText((text) => {
+        text.setValue(defaultVal);
+        text.inputEl.addClass('project-name-input');
+        this.input = text;
+      });
+
+      new Setting(contentEl).addButton((btn) =>
+        btn
+          .setButtonText('Save')
+          .setCta()
+          .onClick(() => {
+            const val = this.input.getValue();
+            this.close();
+            this.options.setSetting('settings', 'project_name', val, false);
+          }),
+      );
+    });
+  }
+
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
+  }
+}
+
+class WakaTimeSettingTab extends PluginSettingTab {
+  private readonly plugin: WakaTime;
+
+  constructor(app: App, plugin: WakaTime) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  public display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl('h2', { text: 'WakaTime Settings' });
+
+    const fragment = document.createDocumentFragment();
+    const link = document.createElement('a');
+    link.href =
+      'https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressions#writing_a_regular_expression_pattern';
+    link.text = 'MDN - Regular expressions';
+    fragment.append('RegExp patterns to ignore. One pattern per line. See ');
+    fragment.append(link);
+    fragment.append(' for help.');
+
+    new Setting(containerEl)
+      .setName('ApiKey')
+      .setDesc(fragment)
+      .addTextArea((textArea) => {
+        textArea.inputEl.setAttr('rows', 6);
+        textArea
+          .setPlaceholder('^daily/\n\\.png$\nfoobar.*baz')
+          .setValue(this.plugin.data.omittedPaths.join('\n'));
+        textArea.inputEl.onblur = (e: FocusEvent) => {
+          const patterns = (e.target as HTMLInputElement).value;
+          this.plugin.data.omittedPaths = patterns.split('\n');
+          this.plugin.pruneOmittedFiles();
+          this.plugin.view.redraw();
+        };
+      });
+
+    new Setting(containerEl)
+      .setName('List length')
+      .setDesc('Maximum number of filenames to keep in the list.')
+      .addText((text) => {
+        text.inputEl.setAttr('type', 'number');
+        text.inputEl.setAttr('placeholder', defaultMaxLength);
+        text
+          .setValue(this.plugin.data.maxLength?.toString())
+          .onChange((value) => {
+            const parsed = parseInt(value, 10);
+            if (!Number.isNaN(parsed) && parsed <= 0) {
+              new Notice('List length must be a positive integer');
+              return;
+            }
+          });
+        text.inputEl.onblur = (e: FocusEvent) => {
+          const maxfiles = (e.target as HTMLInputElement).value;
+          const parsed = parseInt(maxfiles, 10);
+          this.plugin.data.maxLength = parsed;
+          this.plugin.pruneLength();
+          this.plugin.view.redraw();
+        };
+      });
+
+    new Setting(containerEl)
+      .setName('Open note in')
+      .setDesc(
+        'Open the clicked recent file record in a new tab, split, or window (only works on the desktop app).',
+      )
+      .addDropdown((dropdown) => {
+        const options: Record<string, string> = {
+          tab: 'tab',
+          split: 'split',
+          window: 'window',
+        };
+
+        dropdown
+          .addOptions(options)
+          .setValue(this.plugin.data.openType)
+          .onChange(async (value) => {
+            this.plugin.data.openType = value;
+            await this.plugin.saveData();
+            this.display();
+          });
+      });
+
+    const div = containerEl.createEl('div', {
+      cls: 'recent-files-donation',
+    });
+
+    const donateText = document.createElement('p');
+    donateText.appendText(
+      'If this plugin adds value for you and you would like to help support ' +
+        'continued development, please use the buttons below:',
+    );
+    div.appendChild(donateText);
+
   }
 }
